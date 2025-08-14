@@ -46,7 +46,7 @@ def scrape_immoweb_listings(url, pages=1, pause=2.0):
                 link = urljoin("https://www.immoweb.be", link)
 
             # Price
-            price_el = c.select_one('[class*="price"], .card__price, .srp-card-price")
+            price_el = c.select_one('[class*="price"], .card__price, .srp-card-price')
             price_txt = price_el.get_text(" ", strip=True) if price_el else None
             price = parse_price(price_txt)
 
