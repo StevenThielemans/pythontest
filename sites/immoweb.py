@@ -151,4 +151,78 @@ def _http_fetch(url: str, headers: Dict = None, timeout: int = 30) -> str:
 
 def _browser_fetch(url: str, wait_selector: str = "body", timeout_ms: int = 15000) -> str:
     if not _PLAYWRIGHT_AVAILABLE:
-        raise RuntimeError("Playwright not installed. Run: pip install playwright &&
+        raise RuntimeError("Playwright not installed. Run: pip install playwright && playwright install chromium")
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=True)
+        context = browser.new_context(user_agent=DEFAULT_HEADERS["User-Agent"], locale="en-US")
+        page = context.new_page()
+        # Try to click consent if present
+        page.goto(url, timeout=timeout_ms)
+        try:
+            page.get_by_role("button", name=re.compile("accept|agree", re.I)).click(timeout=3000)
+        except Exception:
+            pass
+        # Wait for network to be idle-ish
+        page.wait_for_timeout(1200)
+        html = page.content()
+        context.close()
+        browser.close()
+        return html
+
+def scrape_immoweb_listings(search_url: str, pages: int = 1, pause: float = 1.5,
+                            use_browser: bool = False) -> List[Dict]:
+    """
+    Robust Immoweb scraper:
+    - Tries to parse embedded JSON via HTTP (fast, low footprint).
+    - If none found and use_browser=True, renders with Playwright and retries parsing.
+    """
+    results: List[Dict] = []
+    for page in range(1, max(1, pages) + 1):
+        url = search_url
+        if "page=" in url:
+            url = re.sub(r"page=\d+", f"page={page}", url)
+        else:
+            sep = "&" if "?" in url else "?"
+            url = f"{url}{sep}page={page}"
+
+        html = ""
+        try:
+            html = _http_fetch(url)
+        except Exception as e:
+            # If HTTP failed and browser mode requested, try browser fetch
+            if use_browser:
+                try:
+                    html = _browser_fetch(url)
+                except Exception as be:
+                    print(f"Browser fetch failed: {be}")
+                    break
+            else:
+                print(f"HTTP fetch failed on page {page}: {e}")
+                break
+
+        items = (_parse_from_next_data(html) or
+                 _parse_from_initial_state(html) or
+                 _parse_from_window_classifieds(html))
+
+        if not items and use_browser:
+            # If HTTP didn’t surface JSON, try browser content explicitly
+            try:
+                html = _browser_fetch(url)
+                items = (_parse_from_next_data(html) or
+                         _parse_from_initial_state(html) or
+                         _parse_from_window_classifieds(html))
+            except Exception as be:
+                print(f"Browser retry failed: {be}")
+
+        if not items:
+            # Stop paging if nothing is found on the first page (likely consent/structure change)
+            print(f"No embedded listings JSON found on page {page}.")
+            if page == 1:
+                break
+            else:
+                continue
+
+        normalized = _normalize_items(items)
+        results.extend(normalized)
+        time.sleep(max(0.3, pause))
+    return results
