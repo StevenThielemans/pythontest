@@ -1,136 +1,97 @@
-import json, re, time
+import re, json, time
 from typing import List, Dict, Optional
-
 import requests
+from bs4 import BeautifulSoup
 
-# Optional browser fallback (Playwright)
-try:
-    from playwright.sync_api import sync_playwright
-    _PLAYWRIGHT_AVAILABLE = True
-except Exception:
-    _PLAYWRIGHT_AVAILABLE = False
-
-DEFAULT_HEADERS = {
+HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
         "AppleWebKit/537.36 (KHTML, like Gecko) "
         "Chrome/124.0.0.0 Safari/537.36"
-    ),
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-    "Accept-Language": "en-US,en;q=0.9",
-    "Referer": "https://www.immoweb.be/",
+    )
 }
 
-def _clean_int(x):
-    if x is None: return None
-    if isinstance(x, (int, float)): return int(x)
-    s = re.sub(r"[^\d]", "", str(x))
-    return int(s) if s else None
+def _clean_int(s):
+    if s is None: return None
+    if isinstance(s, (int, float)): return int(s)
+    d = re.sub(r"[^\d]", "", str(s))
+    return int(d) if d else None
 
-def _clean_float(x):
-    if x is None: return None
-    if isinstance(x, (int, float)): return float(x)
-    s = re.sub(r"[^\d.,]", "", str(x)).replace(",", ".")
+def _clean_float(s):
+    if s is None: return None
+    if isinstance(s, (int, float)): return float(s)
+    d = re.sub(r"[^\d.,]", "", str(s)).replace(",", ".")
     try:
-        return float(s)
+        return float(d)
     except Exception:
         return None
 
-def _parse_from_next_data(html: str) -> Optional[List[Dict]]:
-    """
-    Primary: parse <script id="__NEXT_DATA__"> JSON (Next.js) and walk until classifieds.
-    """
+def _extract_from_next_data(html: str):
     m = re.search(r'<script\s+id="__NEXT_DATA__"[^>]*>\s*({.+?})\s*</script>', html, re.S)
-    if not m: 
-        return None
+    if not m: return None
     try:
         data = json.loads(m.group(1))
     except json.JSONDecodeError:
         return None
-
-    # Heuristic walk to find list-like classifieds
     found = []
-    def walk(obj):
-        if isinstance(obj, dict):
-            # Common keys that hold listings arrays
-            for k in ("classifieds", "items", "results", "list", "properties"):
-                v = obj.get(k)
+    def walk(o):
+        if isinstance(o, dict):
+            for k in ("classifieds","items","results","list","properties"):
+                v = o.get(k)
                 if isinstance(v, list) and v and isinstance(v[0], dict):
                     found.extend(v)
-            for v in obj.values():
-                walk(v)
-        elif isinstance(obj, list):
-            for v in obj:
-                walk(v)
-
+            for v in o.values(): walk(v)
+        elif isinstance(o, list):
+            for v in o: walk(v)
     walk(data)
     return found or None
 
-def _parse_from_initial_state(html: str) -> Optional[List[Dict]]:
-    """
-    Secondary: parse window.__INITIAL_STATE__ = {...};
-    """
+def _extract_from_window_initial_state(html: str):
     m = re.search(r"window\.__INITIAL_STATE__\s*=\s*({.*?});\s*</script>", html, re.S)
-    if not m: 
-        return None
+    if not m: return None
     try:
         data = json.loads(m.group(1))
     except json.JSONDecodeError:
         return None
-
     found = []
-    def walk(obj):
-        if isinstance(obj, dict):
-            for k in ("classifieds", "items", "results", "list", "properties"):
-                v = obj.get(k)
+    def walk(o):
+        if isinstance(o, dict):
+            for k in ("classifieds","items","results","list","properties"):
+                v = o.get(k)
                 if isinstance(v, list) and v and isinstance(v[0], dict):
                     found.extend(v)
-            for v in obj.values():
-                walk(v)
-        elif isinstance(obj, list):
-            for v in obj:
-                walk(v)
+            for v in o.values(): walk(v)
+        elif isinstance(o, list):
+            for v in o: walk(v)
     walk(data)
     return found or None
 
-def _parse_from_window_classifieds(html: str) -> Optional[List[Dict]]:
-    """
-    Tertiary: window.classifieds = [ {...}, ... ];
-    """
+def _extract_from_window_classifieds(html: str):
     m = re.search(r"window\.classifieds\s*=\s*(\[\s*{.*?}\s*]);", html, re.S)
-    if not m:
-        return None
+    if not m: return None
     try:
         return json.loads(m.group(1))
     except json.JSONDecodeError:
         return None
 
-def _normalize_items(items: List[Dict]) -> List[Dict]:
-    """
-    Map Immoweb JSON variations to our common dict format.
-    """
+def _normalize_json_items(items: List[Dict]) -> List[Dict]:
     out = []
     for it in items:
-        # Some structures nest data under different keys
         price_obj = it.get("price") or {}
         prop = it.get("property") or it.get("realEstate") or {}
         loc = prop.get("location") if isinstance(prop, dict) else {}
         cid = it.get("id") or it.get("classifiedId")
-
         price = price_obj.get("mainValue") or it.get("priceValue") or price_obj.get("value")
-        area = (prop.get("netHabitableSurface") or prop.get("netHabitable") or
-                prop.get("livingArea") or prop.get("surface"))
+        area = prop.get("netHabitableSurface") or prop.get("livingArea") or prop.get("surface")
         bedrooms = prop.get("bedroomCount") or prop.get("bedrooms")
         city = (loc.get("locality") or loc.get("localityName") or "")
-        postal = (loc.get("postalCode") or "")
+        postal = loc.get("postalCode") or ""
         if city and postal:
             city = f"{postal} {city}"
-
         price = _clean_int(price)
         area = _clean_float(area)
         bedrooms = _clean_int(bedrooms)
         link = f"https://www.immoweb.be/en/classified/{cid}" if cid else None
-
         if price:
             out.append({
                 "price": float(price),
@@ -141,42 +102,65 @@ def _normalize_items(items: List[Dict]) -> List[Dict]:
             })
     return out
 
-def _http_fetch(url: str, headers: Dict = None, timeout: int = 30) -> str:
-    h = dict(DEFAULT_HEADERS)
-    if headers:
-        h.update(headers)
-    r = requests.get(url, headers=h, timeout=timeout)
-    r.raise_for_status()
-    return r.text
-
-def _browser_fetch(url: str, wait_selector: str = "body", timeout_ms: int = 15000) -> str:
-    if not _PLAYWRIGHT_AVAILABLE:
-        raise RuntimeError("Playwright not installed. Run: pip install playwright && playwright install chromium")
-    with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True)
-        context = browser.new_context(user_agent=DEFAULT_HEADERS["User-Agent"], locale="en-US")
-        page = context.new_page()
-        # Try to click consent if present
-        page.goto(url, timeout=timeout_ms)
-        try:
-            page.get_by_role("button", name=re.compile("accept|agree", re.I)).click(timeout=3000)
-        except Exception:
-            pass
-        # Wait for network to be idle-ish
-        page.wait_for_timeout(1200)
-        html = page.content()
-        context.close()
-        browser.close()
-        return html
-
-def scrape_immoweb_listings(search_url: str, pages: int = 1, pause: float = 1.5,
-                            use_browser: bool = False) -> List[Dict]:
+def _extract_from_cards(html: str) -> List[Dict]:
     """
-    Robust Immoweb scraper:
-    - Tries to parse embedded JSON via HTTP (fast, low footprint).
-    - If none found and use_browser=True, renders with Playwright and retries parsing.
+    Parse listing cards present in your saved page:
+    - li.search-results__item > article#classified_...
+    - price in p.card--result__price.price__formatted
+    - details in p.card__information--property (e.g. '3 bdr. · 208 m²')
+    - city in the next p.card__information (e.g. '5100 JAMBES')
     """
+    soup = BeautifulSoup(html, "html.parser")
+    out = []
+    for li in soup.select("li.search-results__item"):
+        art = li.select_one("article[id^=classified_]")
+        if not art:
+            continue
+        link_tag = art.select_one("h2 a[href]")
+        url = link_tag["href"] if link_tag else None
+
+        # Price
+        price_el = art.select_one("p.card--result__price")
+        price_text = price_el.get_text(" ", strip=True) if price_el else ""
+        price = _clean_int(price_text)
+
+        # Property info: bedrooms + m²
+        info_prop = art.select_one("p.card__information--property")
+        bedrooms = None
+        area = None
+        if info_prop:
+            txt = info_prop.get_text(" ", strip=True)
+            m_bed = re.search(r"(\d+)\s*bdr", txt, re.I)
+            if m_bed: bedrooms = _clean_int(m_bed.group(1))
+            m_area = re.search(r"(\d+[.,]?\d*)\s*m²", txt, re.I)
+            if m_area: area = _clean_float(m_area.group(1))
+
+        # City line: usually the next p.card__information in the same block
+        city = None
+        # Try the sibling info elements
+        all_info = art.select("div.card__informations p.card__information")
+        if all_info:
+            for p in all_info:
+                if "property" in p.get("class", []):
+                    continue
+                city = p.get_text(" ", strip=True)
+                break
+
+        if price:
+            out.append({
+                "price": float(price),
+                "area_m2": float(area) if area else None,
+                "bedrooms": bedrooms,
+                "city": city,
+                "url": url,
+            })
+    return out
+
+def scrape_immoweb_listings(search_url: str, pages: int = 1, pause: float = 1.5) -> List[Dict]:
     results: List[Dict] = []
+    session = requests.Session()
+    session.headers.update(HEADERS)
+
     for page in range(1, max(1, pages) + 1):
         url = search_url
         if "page=" in url:
@@ -185,44 +169,37 @@ def scrape_immoweb_listings(search_url: str, pages: int = 1, pause: float = 1.5,
             sep = "&" if "?" in url else "?"
             url = f"{url}{sep}page={page}"
 
-        html = ""
-        try:
-            html = _http_fetch(url)
-        except Exception as e:
-            # If HTTP failed and browser mode requested, try browser fetch
-            if use_browser:
-                try:
-                    html = _browser_fetch(url)
-                except Exception as be:
-                    print(f"Browser fetch failed: {be}")
-                    break
-            else:
-                print(f"HTTP fetch failed on page {page}: {e}")
+        r = session.get(url, timeout=30)
+        if r.status_code != 200:
+            print(f"HTTP {r.status_code} on page {page}")
+            break
+
+        html = r.text
+
+        # 1) Try HTML cards (works on your file)
+        card_items = _extract_from_cards(html)
+        if card_items:
+            results.extend(card_items)
+            time.sleep(max(0.3, pause))
+            continue
+
+        # 2) Fallbacks: embedded JSON variants
+        for extractor in (_extract_from_next_data, _extract_from_window_initial_state, _extract_from_window_classifieds):
+            items = extractor(html)
+            if items:
+                results.extend(_normalize_json_items(items))
                 break
 
-        items = (_parse_from_next_data(html) or
-                 _parse_from_initial_state(html) or
-                 _parse_from_window_classifieds(html))
-
-        if not items and use_browser:
-            # If HTTP didn’t surface JSON, try browser content explicitly
-            try:
-                html = _browser_fetch(url)
-                items = (_parse_from_next_data(html) or
-                         _parse_from_initial_state(html) or
-                         _parse_from_window_classifieds(html))
-            except Exception as be:
-                print(f"Browser retry failed: {be}")
-
-        if not items:
-            # Stop paging if nothing is found on the first page (likely consent/structure change)
-            print(f"No embedded listings JSON found on page {page}.")
-            if page == 1:
-                break
-            else:
-                continue
-
-        normalized = _normalize_items(items)
-        results.extend(normalized)
         time.sleep(max(0.3, pause))
-    return results
+
+    # Deduplicate by URL
+    seen = set()
+    dedup = []
+    for x in results:
+        key = x.get("url") or (x.get("price"), x.get("area_m2"), x.get("city"))
+        if key in seen:
+            continue
+        seen.add(key)
+        dedup.append(x)
+
+    return dedup
